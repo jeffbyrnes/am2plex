@@ -2,58 +2,58 @@
 
 class String
   def sanitize_for_finding
-    gsub("'", "’").gsub("-", "‐").strip
+    gsub("'", '’').gsub('-', '‐').strip
   end
 end
 
 class PlexMetadataItemSetting < ActiveRecord::Base
-  self.table_name = "metadata_item_settings"
+  self.table_name = 'metadata_item_settings'
 end
 
 class PlexMetadataItemView < ActiveRecord::Base
-  self.table_name = "metadata_item_views"
+  self.table_name = 'metadata_item_views'
 end
 
 class PlexMetadataItem < ActiveRecord::Base
-  self.table_name = "metadata_items"
+  self.table_name = 'metadata_items'
 
   def self.instance_method_already_implemented?(method_name)
-    return true if method_name == "hash"
+    return true if method_name == 'hash'
 
     super
   end
 
-  CONFIG_DIR = File.expand_path("../config", __dir__)
+  CONFIG_DIR = File.expand_path('../config', __dir__)
 
   def self.load_mapping(filename)
     path = File.join(CONFIG_DIR, filename)
     File.exist?(path) ? JSON.parse(File.read(path)) : {}
   end
 
-  ARTIST_MAPPING = load_mapping("artist_mapping.json")
-  ALBUM_MAPPING = load_mapping("album_mapping.json")
-  TRACK_MAPPING = load_mapping("track_mapping.json")
+  ARTIST_MAPPING = load_mapping('artist_mapping.json')
+  ALBUM_MAPPING = load_mapping('album_mapping.json')
+  TRACK_MAPPING = load_mapping('track_mapping.json')
 end
 
 class PlexArtist < PlexMetadataItem
-  has_many :albums, foreign_key: "parent_id", class_name: "PlexAlbum"
+  has_many :albums, foreign_key: 'parent_id', class_name: 'PlexAlbum'
   default_scope { where(metadata_type: 8) }
 
   def self.find_by_name(name)
     sanitized_name = ARTIST_MAPPING[name] || name.sanitize_for_finding
-    where("lower(title) = ?", sanitized_name.downcase).first
+    where('lower(title) = ?', sanitized_name.downcase).first
   end
 end
 
 class PlexAlbum < PlexMetadataItem
-  belongs_to :artist, foreign_key: "parent_id", class_name: "PlexArtist", inverse_of: :albums
-  has_many :tracks, foreign_key: "parent_id", class_name: "PlexTrack"
-  has_one :metadata_item_setting, primary_key: "guid", foreign_key: "guid", class_name: "PlexMetadataItemSetting"
+  belongs_to :artist, foreign_key: 'parent_id', class_name: 'PlexArtist', inverse_of: :albums
+  has_many :tracks, foreign_key: 'parent_id', class_name: 'PlexTrack'
+  has_one :metadata_item_setting, primary_key: 'guid', foreign_key: 'guid', class_name: 'PlexMetadataItemSetting'
   default_scope { where(metadata_type: 9) }
 
   def self.find_by_name(name)
     sanitized_name = ALBUM_MAPPING[name] || name.sanitize_for_finding
-    where("lower(title) = ?", sanitized_name.downcase).first
+    where('lower(title) = ?', sanitized_name.downcase).first
   end
 
   def set_rating(rating, account_id)
@@ -63,20 +63,21 @@ class PlexAlbum < PlexMetadataItem
 end
 
 class PlexTrack < PlexMetadataItem
-  belongs_to :album, foreign_key: "parent_id", class_name: "PlexAlbum", inverse_of: :tracks
-  has_one :metadata_item_setting, primary_key: "guid", foreign_key: "guid", class_name: "PlexMetadataItemSetting"
-  has_many :metadata_item_views, primary_key: "guid", foreign_key: "guid", class_name: "PlexMetadataItemView"
+  belongs_to :album, foreign_key: 'parent_id', class_name: 'PlexAlbum', inverse_of: :tracks
+  has_one :metadata_item_setting, primary_key: 'guid', foreign_key: 'guid', class_name: 'PlexMetadataItemSetting'
+  has_many :metadata_item_views, primary_key: 'guid', foreign_key: 'guid', class_name: 'PlexMetadataItemView'
   default_scope { where(metadata_type: 10) }
 
   def self.find_by_name(name)
     sanitized_name = TRACK_MAPPING[name] || name.sanitize_for_finding
-    where("lower(title) = ?", sanitized_name.downcase).first
+    where('lower(title) = ?', sanitized_name.downcase).first
   end
 
   def self.find_by_name_and_artist_name(name, artist_name)
     sanitized_name = TRACK_MAPPING[name] || name.sanitize_for_finding
     sanitized_artist_name = ARTIST_MAPPING[artist_name] || artist_name.sanitize_for_finding
-    where("lower(title) = ? AND lower(original_title) = ?", sanitized_name.downcase, sanitized_artist_name.downcase).first
+    where('lower(title) = ? AND lower(original_title) = ?', sanitized_name.downcase,
+          sanitized_artist_name.downcase).first
   end
 
   def set_rating(rating, account_id)
@@ -86,7 +87,7 @@ class PlexTrack < PlexMetadataItem
 
   def add_listen_at(datetime, account_id, device_id)
     metadata_item_views.create(
-      thumb_url: "",
+      thumb_url: '',
       account_id: account_id,
       guid: guid,
       metadata_type: 10,
@@ -108,7 +109,7 @@ class PlexTrack < PlexMetadataItem
     )
   end
 
-  def add_skip_at(datetime, account_id, device_id)
+  def add_skip_at(datetime, _account_id, _device_id)
     build_metadata_item_setting unless metadata_item_setting
     metadata_item_setting.update(
       skip_count: (metadata_item_setting.skip_count || 0) + 1,
