@@ -63,6 +63,7 @@ tracks_to_match.each do |apple_music_track|
   plex_track = PlexTrack.match(
     apple_music_track['Name'],
     apple_music_track['Album'],
+    artist: apple_music_track['Album Artist'] || apple_music_track['Artist'],
     track_number: apple_music_track['Track Number']
   )
 

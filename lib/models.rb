@@ -53,6 +53,7 @@ class PlexMetadataItem < ActiveRecord::Base
     File.exist?(path) ? JSON.parse(File.read(path)) : {}
   end
 
+  ARTIST_MAPPING = load_mapping('artist_mapping.json')
   ALBUM_MAPPING = load_mapping('album_mapping.json')
   TRACK_MAPPING = load_mapping('track_mapping.json')
 end
@@ -82,10 +83,11 @@ class PlexTrack < PlexMetadataItem
 
   # Match an Apple Music track to a Plex track by requiring BOTH the track title
   # AND the album title to agree (after normalization). Artist is deliberately
-  # ignored: Plex files artists very differently (collaborations, compilations,
-  # guest features), so an album+title agreement is both more reliable and keeps
-  # false positives low.
-  def self.match(track_name, album_name, track_number: nil)
+  # NOT required: Plex files artists very differently (collaborations,
+  # compilations, guest features), so an album+title agreement is both more
+  # reliable and keeps false positives low. Artist and track number are only
+  # used to break ties when several albums collide on the same title.
+  def self.match(track_name, album_name, artist: nil, track_number: nil)
     return nil if track_name.to_s.empty? || album_name.to_s.empty?
 
     track_name = TRACK_MAPPING[track_name] || track_name
@@ -102,8 +104,22 @@ class PlexTrack < PlexMetadataItem
     end
     return nil if hits.empty?
 
-    chosen = (track_number && hits.find { |c| c[:index] == track_number }) || hits.first
-    find(chosen[:id])
+    find(break_tie(hits, artist, track_number)[:id])
+  end
+
+  # Among album+title matches, prefer the candidate whose artist agrees, then
+  # one whose track number agrees, falling back to the first. Artist is a hint
+  # for disambiguation only, never a match requirement.
+  def self.break_tie(hits, artist, track_number)
+    return hits.first if hits.one?
+
+    name = artist && (ARTIST_MAPPING[artist] || artist)
+    artist_norm = name && MatchText.normalize(name)
+    artist_norm = nil if artist_norm == ''
+    by_artist = artist_norm ? hits.select { |c| c[:artist] == artist_norm } : []
+    by_number = track_number ? hits.select { |c| c[:index] == track_number } : []
+
+    (by_artist & by_number).first || by_artist.first || by_number.first || hits.first
   end
 
   # Build (and memoize) an in-memory index of every Plex track, keyed by
@@ -113,14 +129,18 @@ class PlexTrack < PlexMetadataItem
   end
 
   def self.build_match_index
-    album_titles = PlexAlbum.pluck(:id, :title).to_h
+    artist_titles = PlexArtist.pluck(:id, :title).to_h
+    album_info = PlexAlbum.pluck(:id, :title, :parent_id).to_h do |id, title, artist_id|
+      [id, [title, artist_titles[artist_id]]]
+    end
     index = Hash.new { |hash, key| hash[key] = [] }
     pluck(:id, :title, :parent_id, :index).each do |id, title, album_id, track_index|
-      album_title = album_titles[album_id]
+      album_title, artist_title = album_info[album_id]
       entry = {
         id: id,
         album: MatchText.normalize(album_title),
         album_base: MatchText.base(album_title),
+        artist: MatchText.normalize(artist_title),
         index: track_index
       }
       title_norm = MatchText.normalize(title)
