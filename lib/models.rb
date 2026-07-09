@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'cgi'
+
 # Aggressive, symmetric text normalization used to compare Apple Music titles
 # against Plex titles. Applied to BOTH sides so spelling differences (diacritics,
 # apostrophe/dash variants, "&" vs "and", a leading "The", punctuation) stop
@@ -26,6 +28,17 @@ module MatchText
   # so an Apple album matches its differently-tagged Plex counterpart.
   def base(str)
     normalize(str.to_s.gsub(EDITION, ''))
+  end
+
+  # Path below the music library root ("Artist/Album/Track.ext"), normalized for
+  # comparison. The Plex library is a 1:1 copy of the Apple Music files, so this
+  # relative path is identical on both sides once the differing root prefix,
+  # URL-encoding, unicode form (macOS NFD vs. Linux NFC) and case are reconciled.
+  MUSIC_ROOT = %r{.*/media/music/}i
+
+  def relative_path(path)
+    decoded = CGI.unescape(path.to_s.sub(%r{\Afile://}, ''))
+    decoded.sub(MUSIC_ROOT, '').unicode_normalize(:nfc).downcase.chomp('/')
   end
 end
 
@@ -80,6 +93,34 @@ class PlexTrack < PlexMetadataItem
   has_one :metadata_item_setting, primary_key: 'guid', foreign_key: 'guid', class_name: 'PlexMetadataItemSetting'
   has_many :metadata_item_views, primary_key: 'guid', foreign_key: 'guid', class_name: 'PlexMetadataItemView'
   default_scope { where(metadata_type: 10) }
+
+  # Preferred matcher: since Plex is a 1:1 copy of the Apple Music files, an
+  # Apple track's file location resolves to exactly one Plex track by relative
+  # path. This is both more complete and more precise than title matching (it
+  # can never confuse two different recordings that share a title).
+  def self.match_by_path(location)
+    key = MatchText.relative_path(location)
+    return nil if key.empty?
+
+    id = path_index[key]
+    id && find(id)
+  end
+
+  # Memoized index of every Plex track's relative file path -> track id.
+  def self.path_index
+    @path_index ||= begin
+      sql = <<~SQL
+        SELECT t.id AS id, mp.file AS file
+        FROM metadata_items t
+        JOIN media_items mi ON mi.metadata_item_id = t.id
+        JOIN media_parts mp ON mp.media_item_id = mi.id
+        WHERE t.metadata_type = 10 AND mp.file IS NOT NULL
+      SQL
+      connection.exec_query(sql).each_with_object({}) do |row, index|
+        index[MatchText.relative_path(row['file'])] = row['id']
+      end
+    end
+  end
 
   # Match an Apple Music track to a Plex track by requiring BOTH the track title
   # AND the album title to agree (after normalization). Artist is deliberately

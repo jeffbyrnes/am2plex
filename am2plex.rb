@@ -71,18 +71,21 @@ puts "Excluding #{streaming_tracks.size} Apple Music streaming tracks (no local 
 compilations = tracks_to_match.count { |track| track['Compilation'] }
 puts "# of tracks to sync: #{tracks_to_match.size} (#{compilations} from compilations)\n\n"
 
-puts "Matching tracks (album + title must agree)...\n\n"
+puts "Matching tracks (by file path, falling back to album + title)...\n\n"
 
 matched = []   # [apple_music_track, PlexTrack]
 unmatched = [] # apple_music_track
 
 tracks_to_match.each do |apple_music_track|
-  plex_track = PlexTrack.match(
-    apple_music_track['Name'],
-    apple_music_track['Album'],
-    artist: apple_music_track['Album Artist'] || apple_music_track['Artist'],
-    track_number: apple_music_track['Track Number']
-  )
+  # Path match is exact (Plex mirrors the Apple files); album+title is a
+  # fallback for anything whose location doesn't line up.
+  plex_track = PlexTrack.match_by_path(apple_music_track['Location']) ||
+               PlexTrack.match(
+                 apple_music_track['Name'],
+                 apple_music_track['Album'],
+                 artist: apple_music_track['Album Artist'] || apple_music_track['Artist'],
+                 track_number: apple_music_track['Track Number']
+               )
 
   if plex_track
     matched << [apple_music_track, plex_track]
