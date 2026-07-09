@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'cgi'
 require 'itunes_parser'
 require 'json'
 require 'yaml'
@@ -14,6 +15,17 @@ default_date = DateTime.parse(config['default_date'])
 
 def write_missing(path, names)
   File.write(path, JSON.pretty_generate(names.uniq.to_h { |name| [name, name] }))
+end
+
+# Apple Music streaming tracks (HLS media, stored in .movpkg bundles) have no
+# real local file, so they can never exist in a local Plex library. Only tracks
+# backed by an actual audio file are worth trying to match.
+def local_file?(track)
+  return false if track['Track Type'] == 'Remote'
+  return false if track['Kind'].to_s.include?('HLS')
+
+  location = CGI.unescape(track['Location'].to_s).downcase.chomp('/')
+  !location.empty? && !location.end_with?('.movpkg')
 end
 
 if dry_run
@@ -41,13 +53,18 @@ puts "# of tracks from Apple Music: #{apple_music_tracks.size}\n\n"
 puts "Filtering tracks based on these preferences...\n\n"
 puts "Minimum plays: #{config['minimum_plays']}"
 puts "Minimum skips: #{config['minimum_skips']}\n\n"
-tracks_to_match = apple_music_tracks.select do |track|
+played_tracks = apple_music_tracks.select do |track|
   play_count = track['Play Count']
   skip_count = track['Skip Count']
 
   (play_count && play_count >= config['minimum_plays']) ||
     (skip_count && skip_count >= config['minimum_skips'])
 end
+
+# Drop Apple Music streaming tracks up front: they have no local file, so they
+# can't be in Plex and would only ever show up as noise in the "not found" list.
+tracks_to_match, streaming_tracks = played_tracks.partition { |track| local_file?(track) }
+puts "Excluding #{streaming_tracks.size} Apple Music streaming tracks (no local file)\n\n"
 
 # Compilations are matched the same way as everything else: their "artist" in
 # Plex is usually "Various Artists", so album + title is the only reliable key.
