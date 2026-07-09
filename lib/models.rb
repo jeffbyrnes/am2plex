@@ -1,8 +1,44 @@
 # frozen_string_literal: true
 
-class String
-  def sanitize_for_finding
-    gsub("'", '’').gsub('-', '‐').strip
+require 'cgi'
+
+# Aggressive, symmetric text normalization used to compare Apple Music titles
+# against Plex titles. Applied to BOTH sides so spelling differences (diacritics,
+# apostrophe/dash variants, "&" vs "and", a leading "The", punctuation) stop
+# blocking otherwise-identical matches.
+module MatchText
+  module_function
+
+  EDITION = /[(\[][^)\]]*(?:remaster|deluxe|edition|expanded|anniversary|bonus|mono|stereo|version|reissue)[^)\]]*[)\]]/i
+
+  def normalize(str)
+    return '' if str.nil?
+
+    str = str.unicode_normalize(:nfkd)
+    str = str.chars.grep_v(/\p{Mn}/).join # strip diacritics
+    str = str.downcase
+    str = str.gsub(/[’‘'`]/, '').gsub(/[‐\-–—]/, ' ') # drop apostrophes, dashes -> space
+    str = str.gsub(/\s*&\s*/, ' and ')                # & -> and
+    str = str.gsub(/\bthe\b/, ' ')                    # drop "the"
+    str = str.gsub(/[^[:alnum:]\s]/, ' ')             # drop remaining punctuation
+    str.gsub(/\s+/, ' ').strip
+  end
+
+  # Normalize after stripping "(Deluxe Edition)"/"(Remastered)"-style qualifiers,
+  # so an Apple album matches its differently-tagged Plex counterpart.
+  def base(str)
+    normalize(str.to_s.gsub(EDITION, ''))
+  end
+
+  # Path below the music library root ("Artist/Album/Track.ext"), normalized for
+  # comparison. The Plex library is a 1:1 copy of the Apple Music files, so this
+  # relative path is identical on both sides once the differing root prefix,
+  # URL-encoding, unicode form (macOS NFD vs. Linux NFC) and case are reconciled.
+  MUSIC_ROOT = %r{.*/media/music/}i
+
+  def relative_path(path)
+    decoded = CGI.unescape(path.to_s.sub(%r{\Afile://}, ''))
+    decoded.sub(MUSIC_ROOT, '').unicode_normalize(:nfc).downcase.chomp('/')
   end
 end
 
@@ -38,11 +74,6 @@ end
 class PlexArtist < PlexMetadataItem
   has_many :albums, foreign_key: 'parent_id', class_name: 'PlexAlbum'
   default_scope { where(metadata_type: 8) }
-
-  def self.find_by_name(name)
-    sanitized_name = ARTIST_MAPPING[name] || name.sanitize_for_finding
-    where('lower(title) = ?', sanitized_name.downcase).first
-  end
 end
 
 class PlexAlbum < PlexMetadataItem
@@ -50,11 +81,6 @@ class PlexAlbum < PlexMetadataItem
   has_many :tracks, foreign_key: 'parent_id', class_name: 'PlexTrack'
   has_one :metadata_item_setting, primary_key: 'guid', foreign_key: 'guid', class_name: 'PlexMetadataItemSetting'
   default_scope { where(metadata_type: 9) }
-
-  def self.find_by_name(name)
-    sanitized_name = ALBUM_MAPPING[name] || name.sanitize_for_finding
-    where('lower(title) = ?', sanitized_name.downcase).first
-  end
 
   def set_rating(rating, account_id)
     build_metadata_item_setting unless metadata_item_setting
@@ -68,16 +94,102 @@ class PlexTrack < PlexMetadataItem
   has_many :metadata_item_views, primary_key: 'guid', foreign_key: 'guid', class_name: 'PlexMetadataItemView'
   default_scope { where(metadata_type: 10) }
 
-  def self.find_by_name(name)
-    sanitized_name = TRACK_MAPPING[name] || name.sanitize_for_finding
-    where('lower(title) = ?', sanitized_name.downcase).first
+  # Preferred matcher: since Plex is a 1:1 copy of the Apple Music files, an
+  # Apple track's file location resolves to exactly one Plex track by relative
+  # path. This is both more complete and more precise than title matching (it
+  # can never confuse two different recordings that share a title).
+  def self.match_by_path(location)
+    key = MatchText.relative_path(location)
+    return nil if key.empty?
+
+    id = path_index[key]
+    id && find(id)
   end
 
-  def self.find_by_name_and_artist_name(name, artist_name)
-    sanitized_name = TRACK_MAPPING[name] || name.sanitize_for_finding
-    sanitized_artist_name = ARTIST_MAPPING[artist_name] || artist_name.sanitize_for_finding
-    where('lower(title) = ? AND lower(original_title) = ?', sanitized_name.downcase,
-          sanitized_artist_name.downcase).first
+  # Memoized index of every Plex track's relative file path -> track id.
+  def self.path_index
+    @path_index ||= begin
+      sql = <<~SQL
+        SELECT t.id AS id, mp.file AS file
+        FROM metadata_items t
+        JOIN media_items mi ON mi.metadata_item_id = t.id
+        JOIN media_parts mp ON mp.media_item_id = mi.id
+        WHERE t.metadata_type = 10 AND mp.file IS NOT NULL
+      SQL
+      connection.exec_query(sql).each_with_object({}) do |row, index|
+        index[MatchText.relative_path(row['file'])] = row['id']
+      end
+    end
+  end
+
+  # Match an Apple Music track to a Plex track by requiring BOTH the track title
+  # AND the album title to agree (after normalization). Artist is deliberately
+  # NOT required: Plex files artists very differently (collaborations,
+  # compilations, guest features), so an album+title agreement is both more
+  # reliable and keeps false positives low. Artist and track number are only
+  # used to break ties when several albums collide on the same title.
+  def self.match(track_name, album_name, artist: nil, track_number: nil)
+    return nil if track_name.to_s.empty? || album_name.to_s.empty?
+
+    track_name = TRACK_MAPPING[track_name] || track_name
+    album_name = ALBUM_MAPPING[album_name] || album_name
+
+    candidates = match_index[MatchText.normalize(track_name)]
+    candidates = match_index[MatchText.base(track_name)] if candidates.empty?
+    return nil if candidates.empty?
+
+    album_norm = MatchText.normalize(album_name)
+    album_base = MatchText.base(album_name)
+    hits = candidates.select do |c|
+      c[:album] == album_norm || (!album_base.empty? && c[:album_base] == album_base)
+    end
+    return nil if hits.empty?
+
+    find(break_tie(hits, artist, track_number)[:id])
+  end
+
+  # Among album+title matches, prefer the candidate whose artist agrees, then
+  # one whose track number agrees, falling back to the first. Artist is a hint
+  # for disambiguation only, never a match requirement.
+  def self.break_tie(hits, artist, track_number)
+    return hits.first if hits.one?
+
+    name = artist && (ARTIST_MAPPING[artist] || artist)
+    artist_norm = name && MatchText.normalize(name)
+    artist_norm = nil if artist_norm == ''
+    by_artist = artist_norm ? hits.select { |c| c[:artist] == artist_norm } : []
+    by_number = track_number ? hits.select { |c| c[:index] == track_number } : []
+
+    (by_artist & by_number).first || by_artist.first || by_number.first || hits.first
+  end
+
+  # Build (and memoize) an in-memory index of every Plex track, keyed by
+  # normalized title, so matching 25k Apple tracks stays fast.
+  def self.match_index
+    @match_index ||= build_match_index
+  end
+
+  def self.build_match_index
+    artist_titles = PlexArtist.pluck(:id, :title).to_h
+    album_info = PlexAlbum.pluck(:id, :title, :parent_id).to_h do |id, title, artist_id|
+      [id, [title, artist_titles[artist_id]]]
+    end
+    index = Hash.new { |hash, key| hash[key] = [] }
+    pluck(:id, :title, :parent_id, :index).each do |id, title, album_id, track_index|
+      album_title, artist_title = album_info[album_id]
+      entry = {
+        id: id,
+        album: MatchText.normalize(album_title),
+        album_base: MatchText.base(album_title),
+        artist: MatchText.normalize(artist_title),
+        index: track_index
+      }
+      title_norm = MatchText.normalize(title)
+      title_base = MatchText.base(title)
+      index[title_norm] << entry
+      index[title_base] << entry unless title_base == title_norm
+    end
+    index
   end
 
   def set_rating(rating, account_id)

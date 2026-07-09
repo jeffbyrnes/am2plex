@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'cgi'
 require 'itunes_parser'
 require 'json'
 require 'yaml'
@@ -11,6 +12,21 @@ ROOT = __dir__
 config = YAML.load_file(File.join(ROOT, 'config', 'config.yml'))
 dry_run = ARGV.include?('--dry-run')
 default_date = DateTime.parse(config['default_date'])
+
+def write_missing(path, names)
+  File.write(path, JSON.pretty_generate(names.uniq.to_h { |name| [name, name] }))
+end
+
+# Apple Music streaming tracks (HLS media, stored in .movpkg bundles) have no
+# real local file, so they can never exist in a local Plex library. Only tracks
+# backed by an actual audio file are worth trying to match.
+def local_file?(track)
+  return false if track['Track Type'] == 'Remote'
+  return false if track['Kind'].to_s.include?('HLS')
+
+  location = CGI.unescape(track['Location'].to_s).downcase.chomp('/')
+  !location.empty? && !location.end_with?('.movpkg')
+end
 
 if dry_run
   puts 'Here is some information about your Plex server'
@@ -37,7 +53,7 @@ puts "# of tracks from Apple Music: #{apple_music_tracks.size}\n\n"
 puts "Filtering tracks based on these preferences...\n\n"
 puts "Minimum plays: #{config['minimum_plays']}"
 puts "Minimum skips: #{config['minimum_skips']}\n\n"
-filtered_tracks = apple_music_tracks.select do |track|
+played_tracks = apple_music_tracks.select do |track|
   play_count = track['Play Count']
   skip_count = track['Skip Count']
 
@@ -45,115 +61,71 @@ filtered_tracks = apple_music_tracks.select do |track|
     (skip_count && skip_count >= config['minimum_skips'])
 end
 
-# Break up tracks based on whether they are from a compilation
-puts "Splitting up compilation tracks...\n\n"
-compilation_tracks_to_match, tracks_to_match =
-  filtered_tracks.partition { |track| track['Compilation'] }
+# Drop Apple Music streaming tracks up front: they have no local file, so they
+# can't be in Plex and would only ever show up as noise in the "not found" list.
+tracks_to_match, streaming_tracks = played_tracks.partition { |track| local_file?(track) }
+puts "Excluding #{streaming_tracks.size} Apple Music streaming tracks (no local file)\n\n"
 
-puts "# of normal tracks to sync: #{tracks_to_match.size}"
-puts "# of compilation tracks to sync: #{compilation_tracks_to_match.size}\n\n"
+# Compilations are matched the same way as everything else: their "artist" in
+# Plex is usually "Various Artists", so album + title is the only reliable key.
+compilations = tracks_to_match.count { |track| track['Compilation'] }
+puts "# of tracks to sync: #{tracks_to_match.size} (#{compilations} from compilations)\n\n"
 
-puts "Comparing tracks...\n\n"
+puts "Matching tracks (by file path, falling back to album + title)...\n\n"
 
-artists_not_found = []
-albums_not_found = []
-tracks_not_found = []
-tracks_found = []
+matched = []   # [apple_music_track, PlexTrack]
+unmatched = [] # apple_music_track
 
 tracks_to_match.each do |apple_music_track|
-  artist_name = apple_music_track['Album Artist'] || apple_music_track['Artist']
-  album_name = apple_music_track['Album']
-  track_name = apple_music_track['Name']
-  track_number = apple_music_track['Track Number']
+  # Path match is exact (Plex mirrors the Apple files); album+title is a
+  # fallback for anything whose location doesn't line up.
+  plex_track = PlexTrack.match_by_path(apple_music_track['Location']) ||
+               PlexTrack.match(
+                 apple_music_track['Name'],
+                 apple_music_track['Album'],
+                 artist: apple_music_track['Album Artist'] || apple_music_track['Artist'],
+                 track_number: apple_music_track['Track Number']
+               )
 
-  next if artist_name.nil? || album_name.nil? || track_name.nil?
-  next if artist_name.empty? || album_name.empty? || track_name.empty?
-  next if artists_not_found.include?(artist_name)
-
-  artist = PlexArtist.find_by_name(artist_name)
-  if artist.nil?
-    artists_not_found << artist_name
-    next
-  end
-
-  next if albums_not_found.any? { |a| a[:album_name] == album_name }
-
-  album = artist.albums.find_by_name(album_name)
-  if album.nil?
-    albums_not_found << { artist_name: artist_name, album_name: album_name }
-    next
-  end
-
-  track = album.tracks.find_by_name(track_name)
-
-  # try to match track by track number
-  if track.nil? && track_number
-    track = album.tracks.find_by(index: track_number)
-    if track && dry_run
-      puts 'found track by track number'
-      puts "source: #{track_name} - #{track_number} - #{album_name}- #{artist_name}"
-      puts "found:  #{track.title} - #{track.index}\n\n"
-    end
-  end
-
-  if track.nil?
-    tracks_not_found << { artist_name: artist_name, album_name: album_name, track_name: track_name }
+  if plex_track
+    matched << [apple_music_track, plex_track]
   else
-    tracks_found << apple_music_track
+    unmatched << apple_music_track
   end
 end
 
-puts "Artists not found: #{artists_not_found.size}"
-if dry_run
-  puts "Writing missing artists to missing_artists.json...\n\n"
-  artist_hash = artists_not_found.to_h { |artist| [artist, artist] }
-  File.write(File.join(ROOT, 'missing_artists.json'), JSON.pretty_generate(artist_hash))
-  puts artists_not_found
-  puts
-end
+# For the dry-run reports, surface albums/artists that matched *nothing* — those
+# are the ones most likely genuinely absent from Plex (vs. a per-track miss).
+matched_albums = matched.map { |apple, _| apple['Album'] }.compact.to_set
+matched_artists = matched.map { |apple, _| apple['Album Artist'] || apple['Artist'] }.compact.to_set
 
-puts "Albums not found: #{albums_not_found.size}"
-if dry_run
-  puts "Writing missing albums to missing_albums.json...\n\n"
-  album_hash = albums_not_found.to_h { |album| [album[:album_name], album[:album_name]] }
-  File.write(File.join(ROOT, 'missing_albums.json'), JSON.pretty_generate(album_hash))
-  puts(albums_not_found.map { |a| "#{a[:artist_name]} - #{a[:album_name]}" })
-  puts
-end
+missing_albums = unmatched.filter_map { |t| t['Album'] }.uniq.reject { |a| matched_albums.include?(a) }
+missing_artists = unmatched.filter_map do |t|
+  t['Album Artist'] || t['Artist']
+end.uniq.reject { |a| matched_artists.include?(a) }
 
-puts "Tracks not found: #{tracks_not_found.size}"
-if dry_run
-  puts "Writing missing tracks to missing_tracks.json...\n\n"
-  track_hash = tracks_not_found.to_h { |track| [track[:track_name], track[:track_name]] }
-  File.write(File.join(ROOT, 'missing_tracks.json'), JSON.pretty_generate(track_hash))
-  puts(tracks_not_found.map { |t| "#{t[:artist_name]} - #{t[:album_name]} - #{t[:track_name]}" })
-  puts
-end
-
-puts "Tracks found: #{tracks_found.size} out of #{tracks_to_match.size}"
+puts "Tracks matched: #{matched.size} out of #{tracks_to_match.size}"
+puts "Tracks not found: #{unmatched.size}"
+puts "Albums with no matches: #{missing_albums.size}"
+puts "Artists with no matches: #{missing_artists.size}"
 puts
 puts "Time: #{Time.now - start_time} seconds"
 
-exit 0 if dry_run
+if dry_run
+  puts "\nWriting reports (missing_tracks.json, missing_albums.json, missing_artists.json)...\n\n"
+  write_missing(File.join(ROOT, 'missing_tracks.json'), unmatched.filter_map { |t| t['Name'] })
+  write_missing(File.join(ROOT, 'missing_albums.json'), missing_albums)
+  write_missing(File.join(ROOT, 'missing_artists.json'), missing_artists)
+  exit 0
+end
 
-tracks_found.each do |apple_music_track|
-  artist_name = apple_music_track['Album Artist'] || apple_music_track['Artist']
-  album_name = apple_music_track['Album']
-  track_name = apple_music_track['Name']
-  track_number = apple_music_track['Track Number']
+matched.each do |apple_music_track, track|
   play_count = apple_music_track['Play Count']
   last_played_date = apple_music_track['Play Date UTC'] || apple_music_track['Date Modified'] || default_date
   skip_count = apple_music_track['Skip Count']
   last_skipped_date = apple_music_track['Skip Date'] || apple_music_track['Date Modified'] || default_date
   track_rating = apple_music_track['Rating'] / 10 if apple_music_track['Rating']
   album_rating = apple_music_track['Album Rating'] / 10 if apple_music_track['Album Rating']
-
-  artist = PlexArtist.find_by_name(artist_name)
-  album = artist.albums.find_by_name(album_name)
-  track = album.tracks.find_by_name(track_name)
-  track = album.tracks.find_by(index: track_number) if track.nil? && track_number
-
-  next unless track
 
   puts "Importing details of #{apple_music_track['Artist']} - #{apple_music_track['Album']} - #{apple_music_track['Name']}"
 
