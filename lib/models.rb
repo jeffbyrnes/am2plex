@@ -9,7 +9,11 @@ require 'cgi'
 module MatchText
   module_function
 
-  EDITION = /[(\[][^)\]]*(?:remaster|deluxe|edition|expanded|anniversary|bonus|mono|stereo|version|reissue)[^)\]]*[)\]]/i
+  EDITION = /
+    [(\[][^)\]]*
+    (?:remaster|deluxe|edition|expanded|anniversary|bonus|mono|stereo|version|reissue)
+    [^)\]]*[)\]]
+  /ix
 
   def normalize(str)
     return '' if str.nil?
@@ -42,14 +46,19 @@ module MatchText
   end
 end
 
+# Per-account state for a metadata item: rating, view/skip counts, timestamps.
 class PlexMetadataItemSetting < ActiveRecord::Base
   self.table_name = 'metadata_item_settings'
 end
 
+# A single recorded play of a metadata item (one row per listen).
 class PlexMetadataItemView < ActiveRecord::Base
   self.table_name = 'metadata_item_views'
 end
 
+# Base model for Plex's metadata_items table, which holds artists, albums and
+# tracks alike, discriminated by metadata_type. Also loads the optional manual
+# name-mapping files from config/.
 class PlexMetadataItem < ActiveRecord::Base
   self.table_name = 'metadata_items'
 
@@ -71,11 +80,13 @@ class PlexMetadataItem < ActiveRecord::Base
   TRACK_MAPPING = load_mapping('track_mapping.json')
 end
 
+# An artist row (metadata_type 8).
 class PlexArtist < PlexMetadataItem
   has_many :albums, foreign_key: 'parent_id', class_name: 'PlexAlbum'
   default_scope { where(metadata_type: 8) }
 end
 
+# An album row (metadata_type 9).
 class PlexAlbum < PlexMetadataItem
   belongs_to :artist, foreign_key: 'parent_id', class_name: 'PlexArtist', inverse_of: :albums
   has_many :tracks, foreign_key: 'parent_id', class_name: 'PlexTrack'
@@ -88,6 +99,9 @@ class PlexAlbum < PlexMetadataItem
   end
 end
 
+# A track row (metadata_type 10). Owns the matching logic that pairs an Apple
+# Music track with its Plex counterpart, and the writers that import plays,
+# skips and ratings.
 class PlexTrack < PlexMetadataItem
   belongs_to :album, foreign_key: 'parent_id', class_name: 'PlexAlbum', inverse_of: :tracks
   has_one :metadata_item_setting, primary_key: 'guid', foreign_key: 'guid', class_name: 'PlexMetadataItemSetting'
@@ -116,8 +130,8 @@ class PlexTrack < PlexMetadataItem
         JOIN media_parts mp ON mp.media_item_id = mi.id
         WHERE t.metadata_type = 10 AND mp.file IS NOT NULL
       SQL
-      connection.exec_query(sql).each_with_object({}) do |row, index|
-        index[MatchText.relative_path(row['file'])] = row['id']
+      connection.exec_query(sql).to_h do |row|
+        [MatchText.relative_path(row['file']), row['id']]
       end
     end
   end

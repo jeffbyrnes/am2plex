@@ -100,9 +100,8 @@ matched_albums = matched.map { |apple, _| apple['Album'] }.compact.to_set
 matched_artists = matched.map { |apple, _| apple['Album Artist'] || apple['Artist'] }.compact.to_set
 
 missing_albums = unmatched.filter_map { |t| t['Album'] }.uniq.reject { |a| matched_albums.include?(a) }
-missing_artists = unmatched.filter_map do |t|
-  t['Album Artist'] || t['Artist']
-end.uniq.reject { |a| matched_artists.include?(a) }
+unmatched_artists = unmatched.filter_map { |t| t['Album Artist'] || t['Artist'] }
+missing_artists = unmatched_artists.uniq.reject { |a| matched_artists.include?(a) }
 
 puts "Tracks matched: #{matched.size} out of #{tracks_to_match.size}"
 puts "Tracks not found: #{unmatched.size}"
@@ -127,7 +126,8 @@ matched.each do |apple_music_track, track|
   track_rating = apple_music_track['Rating'] / 10 if apple_music_track['Rating']
   album_rating = apple_music_track['Album Rating'] / 10 if apple_music_track['Album Rating']
 
-  puts "Importing details of #{apple_music_track['Artist']} - #{apple_music_track['Album']} - #{apple_music_track['Name']}"
+  puts "Importing details of #{apple_music_track['Artist']} - " \
+       "#{apple_music_track['Album']} - #{apple_music_track['Name']}"
 
   if config['import_plays'] && play_count&.positive?
     puts 'Importing plays to plex database...'
