@@ -10,3 +10,6 @@ missing_artists.json
 missing_albums.json
 missing_tracks.json
 notes.txt
+
+# Built gems
+*.gem

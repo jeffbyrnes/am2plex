@@ -1,158 +1,170 @@
-# Apple Music -> Plex !!
+# am2plex — Apple Music → Plex
 
-This tool will help you import data from your Apple Music library into Plex to help you get going with Plexamp and off horrible streaming music services.
+`am2plex` imports your listening history from Apple Music into Plex, so you can
+move to Plexamp and off the streaming services.
 
-It will import:
+It imports:
 
-- track play counts
-- last played date
-- track skip counts
-- last skiped date
-- album ratings
+- track play counts + last-played date
+- track skip counts + last-skipped date
 - track ratings
+- album ratings
 
-You have the ability to tweak which tracks are skippd by setting the minimum play count and skip count on tracks to import.
+You control which tracks are considered by setting a minimum play count and skip
+count. The tool errs on the side of avoiding false positives — it may not import
+_everything_, but it works hard not to attach your history to the wrong track.
 
-This tool is not perfect. It errs on the side of avoiding false positives. So while it might not import everything, it should at least not make mistakes when matching tracks with your Plex library.
+## How it works
 
-## tl;dr on how it works.
+1. Export your Apple Music library to an XML file.
+2. Copy your Plex SQLite database somewhere safe to work against.
+3. Point a `config.yml` at both files and run a **dry run** to see how well it matches.
+4. (Optional) Adjust matches with mapping files, based on the dry-run reports.
+5. Run it for real to import the data into your copy of the Plex DB.
+6. Move the updated database back into place.
 
-1. export your Apple Music library to an xml file
-1. copy your plex SQLITE database to the project
-1. do a dry run on the script to see how well it matches your items
-1. adjust matches using the data provided from the dry run
-1. run the script to import the data
-1. move your plex db back
+## Installation
 
-## Setup
+`am2plex` is a Ruby gem that installs an `am2plex` executable onto your `$PATH`.
 
-### Install dependencies
+You need SQLite and a Ruby (>= 3.2):
 
     brew install sqlite3
-    bundle install
 
-### Configuration
+Then build and install the gem from a checkout of this repo:
 
-The project has a few things you can configure. You can adjust these in the `config/config.yml` file.
+    gem build am2plex.gemspec
+    gem install ./am2plex-*.gem
 
-| key                  | type | info                                                                                                                            |
-| -------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------- |
-| minimum_plays        | int  | The minimum # of plays to consider a track for importing                                                                        |
-| minimum_skips        | int  | The minimum # of plays to consider a track for importing                                                                        |
-| default_date         | date | a date (yyyy-mm-dd) that the project will use to set a play or skip to if the data is not available from the Apple Music librar |
-| account_id           | int  | your account id on your plex server                                                                                             |
-| device_id            | int  | the device id you want your plays and skips to be attributed to                                                                 |
-| import_skips         | bool | import track play counts                                                                                                        |
-| import_plays         | bool | import track skip counts                                                                                                        |
-| import_album_ratings | bool | import album ratings                                                                                                            |
-| import_track_ratings | bool | import track ratings                                                                                                            |
+That puts `am2plex` on your `$PATH`. Verify with:
 
-Adjusting the `minimum_plays` and `minimum_skips` will be the difference between having a ton of songs (and work to do) matched into your Plex library, or having just a little bit.
+    am2plex --version
 
-**Play with these values a couple times with dry runs to see how many results you end up with.** Do this before you start the manual mapping step listed below.
+> **Working on the gem itself?** Use Bundler instead of installing:
+> `bundle install`, then run `bundle exec exe/am2plex ...`.
 
-#### Account & Device IDs
+## Usage
 
-You're going to need to do a little research to get a few of these items. Mainly the `account_id` and `device_id`.
+    am2plex [options]
 
-When doing a dry run, it will output a list of account and device ids. You can use these to set the values in the config file.
+    -c, --config PATH   Path to the config file (default: config.yml)
+    -n, --dry-run       Preview matches and write reports without touching the Plex DB
+    -v, --version       Print version and exit
+    -h, --help          Print this help and exit
 
-If there's only a single Account ID, then great, use that. If there's multiple, you'll probably want to use the lowest numbered one, as this is probably your main account if you are the server owner.
+`am2plex` reads everything it needs from a single config file. By default it
+looks for `config.yml` in the current directory; use `--config` to point
+elsewhere. A good workflow is to keep the config, your library export, and your
+Plex DB copy together in one directory and run `am2plex` from there.
 
-If there's multiple Device IDs, just pick any. On which device your imported plays will occur on, doens't really matter.
+## Configuration
 
-## Do the thing
+The config is a YAML file. All paths in it are resolved **relative to the config
+file's own location** (absolute paths work too), so you can keep everything in
+one directory and run from there. See
+[`config/config.yml`](config/config.yml) for a complete example.
 
-OK, you can now get on with it.
+| key | type | info |
+| --- | --- | --- |
+| `library` | path | Your exported Apple Music library XML |
+| `database` | path | A copy of your Plex SQLite database |
+| `artist_mapping` | path | Optional manual artist name mappings (see below) |
+| `album_mapping` | path | Optional manual album name mappings |
+| `track_mapping` | path | Optional manual track name mappings |
+| `minimum_plays` | int | Minimum number of plays for a track to be considered for import |
+| `minimum_skips` | int | Minimum number of skips for a track to be considered for import |
+| `default_date` | date | `yyyy-mm-dd` used when a play/skip has no timestamp in the Apple Music export |
+| `account_id` | int | Your Plex account ID (plays/skips are attributed to it) |
+| `device_id` | int | The Plex device ID to attribute plays/skips to |
+| `import_plays` | bool | Import track play counts |
+| `import_skips` | bool | Import track skip counts |
+| `import_track_ratings` | bool | Import track ratings |
+| `import_album_ratings` | bool | Import album ratings |
 
-### Exporting your Apple Music library
+`minimum_plays` and `minimum_skips` are the big dials: they decide whether you
+have a ton of matched songs (and mapping work) or only a little. **Run a few dry
+runs with different values before doing any manual mapping.**
 
-Dump your Apple Music library to an xml file and add it to the project.
+### Finding your account & device IDs
 
-1. Open the Music app on your desktop and go to File > Library > Export Library.
-2. Rename the file to `apple-music.xml` and put it in the `config` directory of this project.
+Run a dry run (below) and it prints the account and device IDs found on your
+server.
 
-### Getting your Plex database
+- **Account ID** — if there's only one, use it. If there are several, the
+  lowest-numbered one is usually your own (the server owner's) account.
+- **Device ID** — pick any; it doesn't really matter which device your imported
+  plays are attributed to.
 
-It's highly recommended to start this project with a copy of your Plex database. Run the dry runs over and over until you've adjusted matches to your liking. Once you've done that, you should feel safer at actually running the script on your real Plex database.
+## Preparing your data
 
-1. Export a Plex database backup at Plex > Settings > Troubleshooting
-2. Rename the file to `plexdb.sqlite` and put it in the `config` directory of this project.
+### Export your Apple Music library
 
-### Do a dry run
+1. Open the Music app and go to **File → Library → Export Library…**
+2. Save the XML somewhere and point `library:` in your config at it.
 
-Doing a dry run will give you feedback on how well your Apple Music tracks are being matched to your Plex library tracks.
+### Copy your Plex database
 
-    script/dry_run
+Always work against a **copy** — never the live database.
 
-The script will dump a lot of information out including:
+1. Export a Plex database backup at **Plex → Settings → Troubleshooting**.
+2. Point `database:` in your config at the copy.
 
-- How many tracks there are in total
-- How many tracks will be attempted to be matched
-- How many artists were not matched
-- How many albums were not matched
-- How many tracks were not matched
+## Do a dry run
 
-#### Matching Files
+    am2plex --config config/config.yml --dry-run
 
-Additionally, it will dump 3 new files into the project. These files are mapping files that you can use to adjust the matches.
+A dry run modifies nothing. It reports how many tracks were read, filtered,
+matched, and missed, and writes three report files into the current directory:
 
-- `missing_artists.json`
-- `missing_albums.json`
 - `missing_tracks.json`
+- `missing_albums.json`
+- `missing_artists.json`
 
-#### Use the generated files to create mappings
+### Improving matches with mapping files
 
-Copy the generated files to the `config` directory and rename them. Then edit their values to create the mapping files.
+The three `missing_*.json` reports double as templates for **mapping files**, which
+override how an Apple Music name is looked up in Plex. To use them, copy a report
+next to your config and rename it:
 
-- `missing_artists.json` -> `artist_mappings.json`
-- `missing_albums.json` -> `album_mappings.json`
-- `missing_tracks.json` -> `track_mappings.json`
+- `missing_artists.json` → `artist_mapping.json`
+- `missing_albums.json` → `album_mapping.json`
+- `missing_tracks.json` → `track_mapping.json`
 
-The key portion of the mapping files is the value from Apple Music that will be used to find it in your Plex library. Overwrite the value to be what is in your Plex library, to help with matches.
+Then reference them from your config (`artist_mapping:`, `album_mapping:`,
+`track_mapping:`) and edit the **values** to match what's in your Plex library.
+Each entry is `"Apple Music name": "Plex name"`. For example, if Apple has the
+artist `Jay Z` but Plex has `JAY-Z`:
 
-For example, if your Apple Music has an artist of "Jay Z" and your Plex library has an artist of "JAY-Z", you would change the value in the mapping file to "JAY-Z".
+    { "Jay Z": "JAY-Z" }
 
-```json
-{ "Jay Z": "JAY-Z" }
-```
+On the next run, that mapping is used to find the artist/album/track in Plex.
 
-Now, when the script runs, it will use your edited value to find that artist/album/track in your Plex library.
+**Tip:** fix artists first — it does the most to unlock track matches — then
+albums. Common causes of a miss:
 
-#### Tips
-
-Try fixing matches on artists first, this will go the longest way at getting more track matches. Once you have a good set of artist matches, move on to albums.
-
-Here's a list of some reason you might not get a match, and what you need to look out for when resolving mappings.
-
-- smart quotes - we attempt to correct these, but sometimes it doesn't work
-- emm dashes - we attempt to correct these, but sometimes it doesn't work
-- missing `The` in the title
+- smart quotes and em dashes (we try to fix these, but not always successfully)
+- a missing `The`
 - `…` vs `...`
-- ` - EP` appended
-- ` - Single` appended
-- `Deluxe Edition` appended to the album name
+- a `- EP`, `- Single`, or `(Deluxe Edition)` suffix on the album/track name
 
-You'll most likely see a ton of missing artists and albums due to the fact that your Plex library just doesn't have some of the modern music you've been listening to for the last few years you have been suffering through with streaming music.
+You'll also see genuinely missing artists and albums — modern music you
+streamed but never added to your local library.
 
-There are many other reasons too. Just make a strong drink, open the text file in one window and your Plex library in another and get to work.
+## Do it for real
 
-#### Do it for real
+Once you're happy with the match count:
 
-OK, so you've done a bunch of dry runs and you're happy with the match count. Let's do it for real now.
+1. **Stop Plex Server** — this is critical.
+2. Locate the live Plex database, make a backup copy, and **never touch that backup**.
+3. Copy the live database to your working directory and point `database:` at it.
+4. Run the import (no `--dry-run`); confirm the prompt:
 
-1. Stop Plex Server - this is critical
-1. Find the production database file for Plex
-   1. Make a copy of it, and never touch it again. It's crucial that you have a back up.
-   1. Copy the original to your project directory and name it `plexdb.sqlite`
-1. Run the script `script/run`
+        am2plex --config config/config.yml
 
-OK, you've imported your old metadata into your Plex database. Now you need to move it back.
+5. Rename the updated copy back to `com.plexapp.plugins.library.db` and move it
+   back where it came from (mind file permissions).
+6. Start Plex Server back up.
 
-1. Rename your `plexdb.sqlite` back to the original name (`com.plexapp.plugins.library.db`)
-1. Move it back to where it originally was (be careful of permission issues)
-1. Start Plex server back up
+## Enjoy
 
-### Enjoy
-
-OK, that should be it. I'm sure a million problems will arise, but I did my best.
+That should be it. A million problems may still arise, but this does its best.
